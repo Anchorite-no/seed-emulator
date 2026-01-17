@@ -193,3 +193,92 @@ sequenceDiagram
     Container->>Container: Exec /interface_setup (Rename NICs, TC)
     Container->>Container: Exec bird -d (Read /etc/bird/bird.conf)
 ```
+
+---
+
+## 5. 深度代码审计 (Code-Level Audit)
+
+本章针对核心实现细节进行逐行级审计，解答关于 Docker 客户端初始化、底层网络命令生成及拓扑遍历的具体实现位置。
+
+### 5.1 Docker Client 初始化
+
+**核心发现**：
+`seedemu` 的核心 Python 库（`seedemu/core` 和 `seedemu/compiler`）**并不直接调用** `docker.from_env()`。它采用了“编译器模式”，只负责生成静态配置文件（`docker-compose.yml`），具体的容器启动由用户在 Shell 中调用 `docker-compose up` 完成。
+
+**哪里真正调用了 API？**
+直接调用 Docker API 的代码主要存在于测试套件、示例代码以及配套的 Web 可视化工具中。
+
+*   **Web 客户端后端**: 使用 Node.js 的 `dockerode` 库。
+    *   **File Path**: `client/backend/src/utils/session-manager.ts`
+    *   **Line 1**: `import dockerode from 'dockerode';`
+*   **以太坊可视化后端**: 使用 Python 的 `docker` 库。
+    *   **File Path**: `tools/Blockchain/EtherView/server/__init__.py`
+    *   **Line 11**: `client = docker.from_env()`
+
+### 5.2 网络命令生成 (String Concatenation)
+
+虽然基础网络依赖 Docker Network Driver，但对于高级网络功能（如 EVPN/VXLAN），`seedemu` 会在 Python 代码中直接拼接 `ip link` 等 Shell 命令字符串。
+
+**具体实现位置**：
+*   **File Path**: `seedemu/layers/Evpn.py`
+*   **Line 38-45**: `EvpnFileTemplates` 字典
+
+**代码片段**:
+```python
+EvpnFileTemplates['vetp_bridge'] = '''\
+auto br-{name}
+iface br-{name} inet manual
+    pre-up          ip link add br-{name} type bridge stp_state 0
+    post-down       ip link del br-{name}
+
+auto vtep-{name}
+iface vtep-{name} inet manual
+    pre-up          ip link add vtep-{name} type vxlan id {vni} dstport 4789 local {loopbackAddress}
+    pre-up          ip link set vtep-{name} master br-{name}
+    post-down       ip link del vtep-{name}
+'''
+```
+**解释**：
+这段 Python 字符串是一个 Debian 网络接口配置模板（`/etc/network/interfaces` 格式）。其中清晰可见：
+*   `ip link add br-{name} type bridge`: 创建网桥。
+*   `ip link add vtep-{name} type vxlan ...`: 创建 VXLAN 隧道接口。
+这段字符串随后会被填充变量（如 `{vni}`），并通过 `setFile` 方法写入到容器内的 `/etc/network/interfaces.d/` 目录中，由容器启动时的 `ifup` 命令触发执行。
+
+### 5.3 拓扑遍历 (Graph Traversal)
+
+Emulator 将 Graph 对象转化为 Docker 容器的核心循环位于 `Docker` 编译器中。
+
+**具体实现位置**：
+*   **File Path**: `seedemu/compiler/Docker.py`
+*   **Line Number**: ~1312 (在 `_doCompile` 方法内)
+
+**代码片段审计**:
+```python
+    def _doCompile(self, emulator: Emulator):
+        registry = emulator.getRegistry()
+
+        # ... (Group Software Logic) ...
+
+        # 第一遍遍历：创建网络 (First Pass: Networks)
+        for ((scope, type, name), obj) in registry.getAll().items():
+            if type == 'net':
+                self._log('creating network: {}/{}...'.format(scope, name))
+                self.__networks += self._compileNet(obj)
+
+        # 第二遍遍历：创建节点 (Second Pass: Nodes)
+        for ((scope, type, name), obj) in registry.getAll().items():
+            if type == 'rnode':  # Router Node
+                self._log('compiling router node {} for as{}...'.format(name, scope))
+                self.__services += self._compileNode(obj)
+
+            if type == 'csnode': # Control Service Node
+                # ...
+                self.__services += self._compileNode(obj)
+
+            # ... 处理其他节点类型 (hnode, rs, snode) ...
+```
+
+**逻辑解析**：
+1.  `registry.getAll()` 返回一个字典，包含了整个仿真拓扑的所有对象（节点、网络、服务等）。
+2.  代码进行了两次遍历。第一次专门挑出 `type == 'net'` 的对象调用 `_compileNet`，生成 `docker-compose` 的 `networks` 部分。
+3.  第二次遍历挑出各种类型的节点 (`rnode`, `hnode` 等)，调用 `_compileNode`，生成 `services` 部分和对应的 `Dockerfile`。
