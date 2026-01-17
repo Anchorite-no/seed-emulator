@@ -349,3 +349,40 @@ sequenceDiagram
         Docker->>Docker: 运行 start.sh (/interface_setup, bird)
     end
 ```
+
+---
+
+## 5. 真实性深度问答 (Authenticity Q&A)
+
+针对“为什么这个仿真器能模拟真实网络”的核心疑问，我们进行深度解答。
+
+### Q1: SEED Emulator 是“仿真 (Emulation)”还是“模拟 (Simulation)”？区别在哪？
+**A:** 这是一个**仿真器 (Emulator)**。
+*   **模拟器 (Simulator)**（如 ns-3）是用数学模型来近似网络的行为。它只是一个运行在单一进程中的程序，不运行真实的操作系统内核，也不运行真实的协议栈代码。
+*   **仿真器 (Emulator)**（如 SEED Emulator）运行真实的软件。当你在 SEED Emulator 的节点上运行 `ping` 时，执行的是真实的 Linux `iputils-ping` 二进制文件，数据包经过的是真实的 Linux 内核 TCP/IP 协议栈，路由决策是由真实的 `bird2` 守护进程做出的。
+*   **结论**: 除非你研究的是物理层信号衰减，否则 SEED Emulator 的行为与真实网络**完全一致**。
+
+### Q2: 为什么我能在模拟器里访问 `google.com`？它是真的连到了互联网吗？
+**A:** 不一定。这是通过 **DNS 劫持 (DNS Shadowing)** 技术实现的。
+*   **机制**: `DomainNameService` 会在模拟器内部启动一个“根域名服务器 (Root Zone)”。
+*   **操作**: 当你定义了一个 Web 服务并将其绑定到 `google.com` 时，模拟器会在内部的根 DNS 中添加一条 A 记录，指向内部的一个容器 IP（比如 `10.100.0.5`）。
+*   **效果**: 容器内的客户端查询 `google.com` 时，会得到内部 IP，并访问内部的 Nginx 服务器。这模拟了真实网站，但流量并未流出宿主机。
+*   **真实连接**: 如果启用了 `RealWorldRouter` 模块，容器确实可以通过 NAT 访问外部真实的互联网。
+
+### Q3: 这里的 Web 服务器和真实互联网上的有区别吗？
+**A:** **没有区别**。
+*   SEED Emulator 启动的 Web 服务器容器里运行的是标准的 **Nginx** 或 **Apache** 软件。
+*   它加载的配置文件（`nginx.conf`）与你在生产环境中使用的语法完全一致。
+*   你可以随时通过 `docker exec` 进入容器，查看日志、修改配置，甚至安装 PHP/Python 后端。它就是一个标准的 Linux 服务器环境。
+
+### Q4: 路由协议是模拟的算法，还是真实的协议交互？
+**A:** 是**完全真实的协议交互**。
+*   路由器节点运行的是 **BIRD Internet Routing Daemon**。这是许多真实互联网交换中心（IXP）和 ISP 正在使用的工业级路由软件。
+*   路由器之间通过 TCP 179 端口建立 BGP 会话，交换 Update 报文。
+*   如果你用 Wireshark 抓包，你会看到标准的 BGP/OSPF 数据包格式，甚至可以与 Cisco/Juniper 的路由器进行互操作。
+
+### Q5: 我能在这些节点上运行黑客工具（如 nmap, wireshark）吗？
+**A:** **完全可以**。
+*   这正是 SEED Emulator 设计的初衷（用于安全教育）。
+*   由于每个节点都是一个 Linux 容器，你可以安装任何 Linux 兼容的工具。
+*   你可以从一个 Host 节点对另一个 Router 节点发起 SYN Flood 攻击，或者进行端口扫描。因为协议栈是真实的，受害节点的内核会产生真实的响应（如 TCP Backlog 溢出）。
