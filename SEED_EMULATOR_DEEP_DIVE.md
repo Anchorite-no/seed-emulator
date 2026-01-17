@@ -79,44 +79,44 @@ graph TD
 ```mermaid
 classDiagram
     class Emulator {
-        +Registry registry [注册表]
-        +LayerDatabase layers [层数据库]
-        +BindingDatabase bindings [绑定]
-        +render() [渲染]
-        +compile() [编译]
+        +Registry registry
+        +LayerDatabase layers
+        +BindingDatabase bindings
+        +render()
+        +compile()
     }
 
     class Layer {
         <<abstract>>
-        +configure(emulator) [配置]
-        +render(emulator) [渲染逻辑]
+        +configure(emulator)
+        +render(emulator)
     }
 
     class Service {
-        +install(node) [安装服务]
+        +install(node)
     }
 
     class Node {
-        +str name [节点名]
-        +int asn [自治系统号]
-        +List~Interface~ interfaces [网卡]
-        +List~File~ files [文件]
-        +appendStartCommand() [添加启动命令]
+        +str name
+        +int asn
+        +List~Interface~ interfaces
+        +List~File~ files
+        +appendStartCommand()
     }
 
     class Router {
-        +addProtocol() [添加路由协议]
-        +addTable() [添加路由表]
+        +addProtocol()
+        +addTable()
     }
 
     class Compiler {
         <<interface>>
-        +compile(emulator) [执行编译]
+        +compile(emulator)
     }
 
     class DockerCompiler {
-        +_doCompile() [生成 Compose]
-        +_compileNode() [生成 Dockerfile]
+        +_doCompile()
+        +_compileNode()
     }
 
     Emulator *-- Layer : 包含
@@ -136,15 +136,20 @@ classDiagram
 
 SEED Emulator 采用“分层（Layer）”设计。每一层都在底层的 Linux 网络设施上叠加新的功能。
 
-### 2.1 物理层模拟 (Base Layer)
-这是地基。它负责“拉网线”。
+### 2.1 物理层模拟 (Base Layer) 与 智能 IP 分配
+这是地基。它负责“拉网线”和“分号码”。
 *   **功能**: 定义自治系统（AS）、路由器、主机和它们之间的物理连接。
-*   **实现**: 生成 Docker Compose 的 `networks` 定义。每个 Network 对应一个 Linux Bridge。如果两个节点都在同一个 Network 里，Docker 就会把它们的 veth pair 插到同一个 Bridge 上。
-*   **关键脚本**: `/interface_setup`。它运行在容器启动时，负责把 Docker 默认分配的 `eth0`, `eth1` 重命名为更有意义的 `net0` (连接内部网络) 或 `net1` (连接 IX)。
+*   **智能 IP 分配 (AddressAssignmentConstraint)**:
+    *   Emulator 并不是随机分配 IP 的，而是遵循一套严格的规则（详见 `seedemu/core/AddressAssignmentConstraint.py`）。
+    *   **主机 (Hosts)**: 默认从网络前缀的 `.71` 开始分配，直到 `.99`。
+    *   **路由器 (Routers)**: 默认从 `.254` 倒序分配到 `.200`。
+    *   **IX 对等互联 (Peering)**: IP 直接映射自 ASN（例如 AS10 在 IX 上的 IP 就是 `.10`），这极大简化了 BGP 配置的调试。
+*   **实现**: 生成 Docker Compose 的 `networks` 定义。每个 Network 对应一个 Linux Bridge。
+*   **关键脚本**: `/interface_setup`。它运行在容器启动时，负责把 Docker 默认分配的 `eth0` 等重命名为 `net0`。
 
 ### 2.2 路由层 (Routing Layer)
 这是神经系统。它让路由器“变聪明”。
-*   **功能**: 为所有路由器安装 BIRD 软件，并开启 Kernel 协议（让 BIRD 能读写内核路由表）和 Device 协议（让 BIRD 能感知网卡状态）。
+*   **功能**: 为所有路由器安装 BIRD 软件，并开启 Kernel 协议（让 BIRD 能读写内核路由表）。
 *   **Loopback 机制**: 自动为每个路由器分配一个 Loopback IP（如 `10.0.0.1/32`）。这是 BGP Peering 的基石，因为物理接口可能会断，但只要路由器还在，Loopback 地址就永远可达。
 
 ### 2.3 内部网关协议 (OSPF Layer)
@@ -152,30 +157,32 @@ SEED Emulator 采用“分层（Layer）”设计。每一层都在底层的 Lin
 *   **原理**:
     *   它自动扫描一个 AS 内的所有路由器接口。
     *   它会生成 BIRD 配置，将这些接口加入 OSPF Area 0。
-    *   **效果**: AS 内的路由器自动互相学习路由。路由器 A 知道怎么去路由器 B 的 Loopback 地址，这为建立 iBGP 打好了基础。
+    *   **效果**: AS 内的路由器自动互相学习路由。路由器 A 知道怎么去路由器 B 的 Loopback 地址。
 
 ### 2.4 边界网关协议 (Ebgp / Ibgp Layer)
 这是互联网的核心。
 *   **IBGP (Interior BGP)**:
     *   **功能**: 在 AS **内部**的路由器之间同步外部路由。
-    *   **实现**: 自动建立“全互联（Full Mesh）”连接。Emulator 会遍历图结构，让 AS 内每两台路由器之间都配置一条 iBGP 会话。
+    *   **实现**: 自动建立“全互联（Full Mesh）”连接。Emulator 遍历图结构，让 AS 内每两台路由器之间都配置 iBGP。
 *   **EBGP (Exterior BGP)**:
     *   **功能**: 在**不同 AS** 之间交换路由。
-    *   **实现**: 当你在 Python 里写 `as1.peering(as2)` 时，Emulator 会找到这两个 AS 的边界路由器，在它们的 BIRD 配置里添加 `neighbor <对方IP> as <对方ASN>`。
+    *   **实现**: 当你在 Python 里写 `as1.peering(as2)` 时，Emulator 会找到这两个 AS 的边界路由器，添加 BGP Neighbor 配置。
 
 ### 2.5 互联网交换中心 (Internet Exchange - IX)
 *   **功能**: 模拟真实世界的 IXP（如 HKIX, AMS-IX）。
-*   **原理**:
-    *   IX 本质上是一个巨大的 Layer 2 交换机（Linux Bridge）。
-    *   连接到 IX 的路由器会获得一个 IX 网段的 IP。
-    *   **Route Server (路由服务器)**: Emulator 甚至支持模拟 RS。这是一种特殊的 BGP 路由器，它不转发数据流量，只负责分发路由表，简化了多方 Peering 的配置。
+*   **原理**: IX 本质上是一个巨大的 Layer 2 交换机（Linux Bridge）。连接到 IX 的路由器会获得一个 IX 网段的 IP。
+*   **Route Server (路由服务器)**: 一种特殊的 BGP 路由器，它不转发数据流量，只负责分发路由表，简化了多方 Peering 的配置。
 
-### 2.6 应用服务层 (Service Layer)
+### 2.6 应用服务层与节点绑定 (Service Layer & Binding)
 除了网络，还能模拟应用。
-*   **Web Service**: 启动 nginx/apache 容器。
-*   **DNS Service**: 启动 Bind9。Emulator 会自动生成 Zone 文件，把模拟网络中的域名解析到对应的内网 IP。
-*   **Botnet (僵尸网络)**: 模拟 C&C 服务器和僵尸节点，用于安全研究。
-*   **BGP Looking Glass**: 一个 Web 界面，允许用户查询某个路由器的 BIRD 状态（`show route`），用于调试网络。
+*   **虚拟节点与物理节点 (Virtual vs Physical)**:
+    *   Service（如 WebService）通常是定义在“虚拟节点”（Virtual Node）上的。
+    *   **绑定机制 (Binding)**: `Emulator` 在渲染时，会查询 `BindingDatabase`。它根据正则表达式（例如 `Action.RANDOM` 或 `Action.NEW`）将虚拟的服务自动“调度”到某个物理的 Host 节点上运行。
+*   **常见服务**:
+    *   **Web Service**: 启动 nginx/apache 容器。
+    *   **DNS Service**: 启动 Bind9。Emulator 自动生成 Zone 文件。
+    *   **Botnet**: 模拟 C&C 控制与僵尸网络。
+    *   **BGP Looking Glass**: 提供 Web 界面查询 BIRD 路由表。
 
 ---
 
@@ -221,52 +228,27 @@ iface vtep-{name} inet manual
 ```
 这个字符串被填充变量后，写入容器的 `/etc/network/interfaces.d/`。当容器启动，Linux 的网络管理器执行这些命令，从而在内核中创建出 VXLAN 隧道。
 
-### 3.3 拓扑遍历：从对象到 YAML
+### 3.3 渲染引擎：递归依赖解析 (Dependency & Rendering)
 
-编译器如何把 Python 对象变成 Docker Service？
-*   **文件**: `seedemu/compiler/Docker.py`
-*   **位置**: `_doCompile` 方法（约第 1300 行）。
+为什么 `Base` 层总是在 `Routing` 层之前执行？这不是巧合，而是设计。
 
-```python
-    def _doCompile(self, emulator: Emulator):
-        # 1. 遍历注册表 (Registry)
-        registry = emulator.getRegistry()
-
-        # 2. 第一轮循环：创建网络 (Networks)
-        # 对应 docker-compose 的 networks 字段
-        for ((scope, type, name), obj) in registry.getAll().items():
-            if type == 'net':
-                self.__networks += self._compileNet(obj)
-
-        # 3. 第二轮循环：创建节点 (Services)
-        # 对应 docker-compose 的 services 字段
-        for ((scope, type, name), obj) in registry.getAll().items():
-            if type == 'rnode': # 路由器
-                self.__services += self._compileNode(obj)
-            elif type == 'hnode': # 主机
-                self.__services += self._compileNode(obj)
-```
+*   **文件**: `seedemu/core/Emulator.py`
+*   **方法**: `__render(layerName)`
+*   **逻辑**:
+    Emulator 维护了一个依赖图。`__render` 方法是一个递归函数：
+    1.  检查当前层是否已渲染（`done` 标记）。
+    2.  读取 `dependencies_db`，找到当前层依赖的所有前置层。
+    3.  **递归调用** `__render` 先去渲染那些前置层。
+    4.  前置层完成后，执行当前层的 `configure()` 和 `render()`。
 
 ### 3.4 镜像构建审计 (Dockerfile Audit)
 
 协议栈是如何被“烧录”进镜像的？我们审计 `docker_images/seedemu-router/Dockerfile`。
 
-1.  **基础镜像**:
-    ```dockerfile
-    FROM handsonsecurity/seedemu-base
-    ```
-    基于 Ubuntu，已经预装了 `iproute2`, `tcpdump` 等基础工具。
-
-2.  **路由软件安装**:
-    ```dockerfile
-    RUN apt-get update && apt-get install -y --no-install-recommends bird2
-    ```
-    这里直接安装了 `bird2` 软件包。
-
+1.  **基础镜像**: `FROM handsonsecurity/seedemu-base`
+2.  **路由软件**: `RUN apt-get install bird2`
 3.  **配置文件注入 (Runtime Injection)**:
-    注意，`Dockerfile` 里只有 `RUN touch /usr/share/doc/bird2/examples/bird.conf`。真正的配置文件并不是在镜像构建时确定的，而是在**编译器运行时**生成的。
-    *   **流程**: `Docker.py` 为每个节点生成专属的 `Dockerfile`，其中包含 `COPY bird.conf /etc/bird/bird.conf`。
-    *   **意义**: 这意味着所有路由器共用同一个镜像（`seedemu-router`），但每个容器启动时加载的配置是独一无二的。
+    真正的 `bird.conf` 并不是在镜像构建时确定的，而是在**编译器运行时**生成的。`Docker.py` 为每个节点生成专属的 `Dockerfile`，其中包含 `COPY bird.conf /etc/bird/bird.conf`。这意味着所有路由器共用同一个镜像，但拥有独一无二的配置。
 
 ---
 
@@ -290,9 +272,9 @@ sequenceDiagram
     rect rgb(240, 248, 255)
         Note right of Emu: 渲染阶段：逻辑计算
         Emu->>Layer: configure() & render()
-        Layer->>Layer: 计算 IP 地址分配
+        Layer->>Layer: 递归解析依赖
+        Layer->>Layer: Binding 分配虚拟节点到物理节点
         Layer->>Layer: 生成 BIRD 配置文件 (内存中)
-        Layer->>Layer: 生成 /interface_setup 脚本
     end
 
     User->>Emu: 3. 调用 compile()
@@ -315,7 +297,6 @@ sequenceDiagram
         Docker->>Docker: 构建镜像 (Build)
         Docker->>Docker: 创建 Linux Bridge
         Docker->>Docker: 启动容器 (Start)
-        Docker->>Docker: 运行 start.sh
-        Docker->>Docker: 运行 BIRD (路由开始交换)
+        Docker->>Docker: 运行 start.sh (/interface_setup, bird)
     end
 ```
