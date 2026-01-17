@@ -79,44 +79,44 @@ graph TD
 ```mermaid
 classDiagram
     class Emulator {
-        +Registry registry
-        +LayerDatabase layers
-        +BindingDatabase bindings
-        +render()
-        +compile()
+        +Registry registry 注册表
+        +LayerDatabase layers 层数据库
+        +BindingDatabase bindings 绑定
+        +render() 渲染
+        +compile() 编译
     }
 
     class Layer {
         <<abstract>>
-        +configure(emulator)
-        +render(emulator)
+        +configure(emulator) 配置
+        +render(emulator) 渲染逻辑
     }
 
     class Service {
-        +install(node)
+        +install(node) 安装服务
     }
 
     class Node {
-        +str name
-        +int asn
-        +List~Interface~ interfaces
-        +List~File~ files
-        +appendStartCommand()
+        +str name 节点名
+        +int asn 自治系统号
+        +List~Interface~ interfaces 网卡
+        +List~File~ files 文件
+        +appendStartCommand() 添加启动命令
     }
 
     class Router {
-        +addProtocol()
-        +addTable()
+        +addProtocol() 添加路由协议
+        +addTable() 添加路由表
     }
 
     class Compiler {
         <<interface>>
-        +compile(emulator)
+        +compile(emulator) 执行编译
     }
 
     class DockerCompiler {
-        +_doCompile()
-        +_compileNode()
+        +_doCompile() 生成Compose
+        +_compileNode() 生成Dockerfile
     }
 
     Emulator *-- Layer : 包含
@@ -129,6 +129,32 @@ classDiagram
     Emulator ..> Compiler : 使用
     Compiler <|-- DockerCompiler : 实现
 ```
+
+### 1.4 数据包漫游指南 (A Packet's Journey)
+
+为了深入理解这套机制，我们跟踪一个 ICMP Echo Request 数据包，假设它从 **主机 A** 发往 **主机 B**（跨 AS）：
+
+1.  **起点 (Host A Container)**:
+    *   用户执行 `ping B_IP`。
+    *   内核查询路由表：`ip route show`。发现目标不在本地子网，匹配到默认网关（Default Gateway）。
+    *   ARP 请求：谁是网关 IP 的 MAC？
+    *   数据包封装：`[Ethernet Dst=GatewayMAC | IP Src=A_IP Dst=B_IP | ICMP]`。
+    *   **出站**: 数据包通过 `veth` 接口离开 Host A 的 Network Namespace。
+
+2.  **传输 (Linux Bridge)**:
+    *   数据包到达宿主机的 `br-xxxx` 网桥。
+    *   网桥根据目标 MAC 地址查找转发表（FDB），将数据包转发到连接网关路由器的 `veth` 端口。
+
+3.  **网关 (Router Container)**:
+    *   数据包进入路由器的 Network Namespace。
+    *   内核解包，发现 MAC 是给自己的，提交给 IP 层。
+    *   IP 层查路由表。**关键点**：这个路由表是由 BIRD 写入的。BIRD 通过 BGP 协议学习到了 `B_IP` 属于哪个 AS，下一跳是谁。
+    *   内核重新封装数据包（修改 MAC 地址为下一跳路由器），再次发回网桥（或另一个网桥）。
+
+4.  **终点 (Host B Container)**:
+    *   经过若干跳路由器后，数据包到达 Host B 所在的子网路由器。
+    *   路由器 ARP 广播找到 Host B。
+    *   数据包送达 Host B，内核回复 ICMP Echo Reply。
 
 ---
 
@@ -166,7 +192,12 @@ SEED Emulator 采用“分层（Layer）”设计。每一层都在底层的 Lin
     *   **实现**: 自动建立“全互联（Full Mesh）”连接。Emulator 遍历图结构，让 AS 内每两台路由器之间都配置 iBGP。
 *   **EBGP (Exterior BGP)**:
     *   **功能**: 在**不同 AS** 之间交换路由。
-    *   **实现**: 当你在 Python 里写 `as1.peering(as2)` 时，Emulator 会找到这两个 AS 的边界路由器，添加 BGP Neighbor 配置。
+    *   **实现**: 见 `seedemu/layers/Ebgp.py`。
+    *   **社区属性 (Communities)**: 为了模拟真实的商业互联关系（Provider/Customer/Peer），Emulator 使用了 BGP Communities 标记路由。
+        *   `LOCAL_COMM`: 本地路由。
+        *   `CUSTOMER_COMM`: 来自客户的路由（可以转卖给所有人）。
+        *   `PEER_COMM`: 来自对等体的路由（只能传给客户，不能传给其他对等体或上游）。
+        *   这通过 BIRD 的 `import filter` 和 `export filter` 模板自动生成。
 
 ### 2.5 互联网交换中心 (Internet Exchange - IX)
 *   **功能**: 模拟真实世界的 IXP（如 HKIX, AMS-IX）。
@@ -178,11 +209,18 @@ SEED Emulator 采用“分层（Layer）”设计。每一层都在底层的 Lin
 *   **虚拟节点与物理节点 (Virtual vs Physical)**:
     *   Service（如 WebService）通常是定义在“虚拟节点”（Virtual Node）上的。
     *   **绑定机制 (Binding)**: `Emulator` 在渲染时，会查询 `BindingDatabase`。它根据正则表达式（例如 `Action.RANDOM` 或 `Action.NEW`）将虚拟的服务自动“调度”到某个物理的 Host 节点上运行。
-*   **常见服务**:
-    *   **Web Service**: 启动 nginx/apache 容器。
-    *   **DNS Service**: 启动 Bind9。Emulator 自动生成 Zone 文件。
-    *   **Botnet**: 模拟 C&C 控制与僵尸网络。
-    *   **BGP Looking Glass**: 提供 Web 界面查询 BIRD 路由表。
+
+### 2.7 域名服务 (DNS) 实现机制
+`DomainNameService.py` 是一个典型的配置生成器。
+*   **Zone 对象**: 在内存中维护 DNS 记录（A, NS, SOA）。
+*   **自动化**: 当你把一个 Host 加入网络时，DNS 层会自动收集它的 IP，并在 Zone 对象中添加 A 记录。
+*   **落地**: `install()` 方法将内存中的 Zone 对象序列化为 BIND9 的标准 Zone 文件格式（如 `/etc/bind/zones/example.com`），并生成 `named.conf.zones` 配置文件。
+
+### 2.8 Web 服务与 Nginx 模板
+`WebService.py` 使用模板注入技术。
+*   **模板**: 定义了标准的 Nginx `server` 块。
+*   **变量替换**: 用 `{serverName}` 和 `{port}` 替换模板中的占位符。
+*   **SSL/TLS**: 如果启用了 HTTPS，它甚至会自动请求 CA 服务生成证书，并配置 Nginx 的 `ssl_certificate` 指令。
 
 ---
 
@@ -249,6 +287,17 @@ iface vtep-{name} inet manual
 2.  **路由软件**: `RUN apt-get install bird2`
 3.  **配置文件注入 (Runtime Injection)**:
     真正的 `bird.conf` 并不是在镜像构建时确定的，而是在**编译器运行时**生成的。`Docker.py` 为每个节点生成专属的 `Dockerfile`，其中包含 `COPY bird.conf /etc/bird/bird.conf`。这意味着所有路由器共用同一个镜像，但拥有独一无二的配置。
+
+### 3.5 扩展性设计：如何自定义组件
+
+SEED Emulator 的架构允许用户通过继承核心类来扩展功能。
+
+*   **自定义 Layer**: 继承 `Layer` 类。
+    *   实现 `getName()` 返回唯一标识。
+    *   实现 `render(emulator)` 注入自定义逻辑（例如，给所有节点添加一个新的监控脚本）。
+    *   使用 `addDependency()` 确保在基础层之后运行。
+*   **自定义 Compiler**: 继承 `Compiler` 类。
+    *   目前主要是 `Docker` 编译器，但理论上可以编写 `KubernetesCompiler`，将 `_compileNode` 的输出适配为 Pod 定义。
 
 ---
 
