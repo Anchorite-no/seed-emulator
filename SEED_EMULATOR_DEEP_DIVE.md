@@ -29,27 +29,27 @@ SEED Emulator 能够在单机上模拟拥有数百个路由器和自治系统（
 
 ```mermaid
 graph TD
-    subgraph Host_Machine [宿主机 Linux Kernel]
-        DockerEngine[Docker Engine]
+    subgraph Host_Machine ["宿主机 Linux Kernel"]
+        DockerEngine["Docker Engine"]
 
-        subgraph Network_Simulation [网络仿真层]
-            Bridge_IX[Linux Bridge (IX 交换中心)]
-            Bridge_LAN[Linux Bridge (AS 内部局域网)]
+        subgraph Network_Simulation ["网络仿真层"]
+            Bridge_IX["Linux Bridge (IX 交换中心)"]
+            Bridge_LAN["Linux Bridge (AS 内部局域网)"]
         end
 
-        subgraph Container_Router [容器: Router Node]
-            Process_BIRD[进程: BIRD (OSPF/BGP)]
-            Kernel_RT[内核路由表]
-            Veth_R[虚拟网卡: net0]
+        subgraph Container_Router ["容器: Router Node"]
+            Process_BIRD["进程: BIRD (OSPF/BGP)"]
+            Kernel_RT["内核路由表"]
+            Veth_R["虚拟网卡: net0"]
 
             Process_BIRD -->|Netlink 写入| Kernel_RT
             Kernel_RT -->|查表转发| Veth_R
         end
 
-        subgraph Container_Host [容器: Host Node]
-            Process_Ping[进程: Ping / Web]
-            Kernel_RT_H[内核路由表]
-            Veth_H[虚拟网卡: net0]
+        subgraph Container_Host ["容器: Host Node"]
+            Process_Ping["进程: Ping / Web"]
+            Kernel_RT_H["内核路由表"]
+            Veth_H["虚拟网卡: net0"]
 
             Process_Ping -->|系统调用| Veth_H
         end
